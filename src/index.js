@@ -25,9 +25,15 @@ app.options("/collect", cors(corsOptions));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.text({ type: "text/plain", limit: "1mb" }));
 
+const isLocal =
+  (process.env.DATABASE_URL || "").includes("localhost") ||
+  (process.env.DATABASE_URL || "").includes("127.0.0.1");
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL
+  connectionString: process.env.DATABASE_URL,
+  ssl: isLocal ? false : { rejectUnauthorized: false }
 });
+
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -59,8 +65,16 @@ app.post("/collect", async (req, res) => {
   if (!isUuid(project_id)) return res.status(400).json({ error: "invalid_project_id" });
   if (!Array.isArray(events)) return res.status(400).json({ error: "events_required" });
   if (events.length > 200) return res.status(400).json({ error: "events_too_many" });
-  // ✅ MOCK MODE (بدون DB) — إذا ما في DB شغّالة
-if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
+const MOCK_MODE = process.env.MOCK_MODE === "1";
+
+// إذا ما في DB configured لا تشتغل MOCK بصمت
+if (!process.env.DATABASE_URL) {
+  console.error("DATABASE_URL is missing on this service");
+  return res.status(500).json({ error: "db_not_configured" });
+}
+
+// MOCK فقط إذا أنت مفعّله
+if (MOCK_MODE) {
   const { project_id, events, sent_at } = body || {};
   console.log("[MOCK] /collect batch:", {
     project_id,
@@ -74,9 +88,9 @@ if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
       anonymous_id: events[0].anonymous_id
     } : null
   });
-
   return res.status(204).send();
 }
+
 
 
   try {
