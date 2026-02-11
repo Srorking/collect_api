@@ -80,6 +80,32 @@ function getPool() {
 
   return pool;
 }
+app.set("trust proxy", true);
+
+function getClientIp(req) {
+  const cf = req.headers["cf-connecting-ip"];
+  if (cf) return String(cf);
+
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) return String(xff).split(",")[0].trim();
+
+  return req.ip || null;
+}
+
+app.post("/collect", (req, res) => {
+  const ip = getClientIp(req);
+
+  const envelope = req.body || {};
+  const events = Array.isArray(envelope.events) ? envelope.events : [];
+
+  for (const ev of events) {
+    ev.context = ev.context || {};
+    ev.context.ip = ip; // ✅ هون بالضبط
+  }
+
+  // بعدين احفظ events
+  res.json({ ok: true });
+});
 
 // -------------------- Helpers --------------------
 const UUID_RE =
