@@ -5,6 +5,7 @@
 // - MOCK_MODE supported
 // - Server-side domain enforcement using projects.allowed_domains + allow_subdomains
 // - Adds per-event UUID (fixes: null value in column "id" of events_raw)
+// - NEW: /bootstrap gate to prevent SDK download if not allowed
 
 import express from "express";
 import cors from "cors";
@@ -33,16 +34,9 @@ const ALLOW_LIST = (process.env.CORS_ORIGINS || "")
 
 const corsOptions = {
   origin: (origin, cb) => {
-    // allow non-browser requests (curl/postman) with no Origin
     if (!origin) return cb(null, true);
-
-    // if no allow-list specified, allow all (reflect origin)
     if (ALLOW_LIST.length === 0) return cb(null, true);
-
-    // allow only listed origins
     if (ALLOW_LIST.includes(origin)) return cb(null, true);
-
-    // reject origin (CORS)
     return cb(null, false);
   },
   methods: ["POST", "OPTIONS", "GET"],
@@ -51,11 +45,9 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
-// IMPORTANT: CORS must be before helmet/routes, and OPTIONS must be global
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-// Helmet (disable CORP to avoid any cross-origin resource policy surprises)
 app.use(
   helmet({
     crossOriginResourcePolicy: false,
@@ -75,7 +67,6 @@ function getPool() {
   const url = process.env.DATABASE_URL;
   if (!url) return null;
 
-  // Render/Postgres often needs TLS. If DATABASE_URL contains sslmode=require => enable ssl.
   const needsSSL = /sslmode=require/i.test(url);
 
   pool = new Pool({
@@ -106,11 +97,9 @@ function parseBody(req) {
 }
 
 function getClientIp(req) {
-  // Cloudflare
   const cf = req.headers["cf-connecting-ip"];
   if (cf) return String(cf);
 
-  // Proxies
   const xff = req.headers["x-forwarded-for"];
   if (xff) return String(xff).split(",")[0].trim();
 
@@ -144,6 +133,15 @@ function isAllowedHost({ host, allowedDomains, allowSubdomains }) {
   return false;
 }
 
+function getIncomingHost(req) {
+  const origin = req.headers.origin ? String(req.headers.origin) : "";
+  const referer = req.headers.referer ? String(req.headers.referer) : "";
+
+  const originHost = origin ? hostFromUrl(origin) : "";
+  const refererHost = referer ? hostFromUrl(referer) : "";
+  return originHost || refererHost || "";
+}
+
 // -------------------- Routes --------------------
 app.get("/health", async (_req, res) => {
   try {
@@ -152,6 +150,61 @@ app.get("/health", async (_req, res) => {
     return res.status(200).json({ ok: true, db: p ? "up" : "not_configured" });
   } catch {
     return res.status(200).json({ ok: true, db: "down" });
+  }
+});
+
+// ✅ NEW: Bootstrap gate
+// Tag will call: GET /bootstrap?pid=<project_uuid>
+// If not allowed => { allow:false } and tag WILL NOT load sdk.min.js
+app.get("/bootstrap", async (req, res) => {
+  try {
+    const project_id = String(req.query.pid || "");
+
+    if (!isUuid(project_id)) {
+      return res.status(400).json({ allow: false, error: "invalid_project_id" });
+    }
+
+    // ✅ allow in mock mode (for testing)
+    if (process.env.MOCK_MODE === "1") {
+      return res.status(200).json({ allow: true, mode: "mock" });
+    }
+
+    const p = getPool();
+    if (!p) {
+      // ✅ IMPORTANT: deny if DB not configured (prevents free usage)
+      return res.status(503).json({ allow: false, error: "db_not_configured" });
+    }
+
+    const proj = await p.query(
+      "select id, allowed_domains, allow_subdomains from projects where id = $1 and is_active = true",
+      [project_id]
+    );
+    if (!proj.rowCount) {
+      return res.status(403).json({ allow: false, error: "project_inactive" });
+    }
+
+    const { allowed_domains, allow_subdomains } = proj.rows[0];
+
+    const host = getIncomingHost(req);
+
+    if (
+      !isAllowedHost({
+        host,
+        allowedDomains: allowed_domains,
+        allowSubdomains: !!allow_subdomains,
+      })
+    ) {
+      return res.status(403).json({
+        allow: false,
+        error: "domain_not_allowed",
+        host: host || null,
+      });
+    }
+
+    return res.status(200).json({ allow: true });
+  } catch (e) {
+    console.error("BOOTSTRAP_ERROR:", e);
+    return res.status(500).json({ allow: false, error: "server_error" });
   }
 });
 
@@ -202,27 +255,21 @@ app.post("/collect", async (req, res) => {
     const { allowed_domains, allow_subdomains } = proj.rows[0];
 
     // ✅ enforce domains server-side (NOT CORS)
-    const origin = req.headers.origin ? String(req.headers.origin) : "";
-    const referer = req.headers.referer ? String(req.headers.referer) : "";
-
-    const originHost = origin ? hostFromUrl(origin) : "";
-    const refererHost = referer ? hostFromUrl(referer) : "";
-    const incomingHost = originHost || refererHost;
+    const host = getIncomingHost(req);
 
     if (
       !isAllowedHost({
-        host: incomingHost,
+        host,
         allowedDomains: allowed_domains,
         allowSubdomains: !!allow_subdomains,
       })
     ) {
       return res.status(403).json({
         error: "domain_not_allowed",
-        host: incomingHost || null,
+        host: host || null,
       });
     }
 
-    // validate + prepare insert
     const values = [];
     const rows = [];
     let idx = 1;
@@ -238,10 +285,8 @@ app.post("/collect", async (req, res) => {
         return res.status(400).json({ error: "invalid_event_ts" });
       }
 
-      // ✅ guarantee event id (fix DB error: events_raw.id NOT NULL)
       const eventId = crypto.randomUUID();
 
-      // ✅ attach ip to context (server truth)
       const context = ev.context && typeof ev.context === "object" ? ev.context : {};
       context.ip = ip;
 
@@ -285,7 +330,6 @@ app.post("/collect", async (req, res) => {
       );
     }
 
-    // ✅ include id column first
     const sql = `
       insert into events_raw (
         id,
@@ -320,7 +364,6 @@ app.listen(port, () => {
   console.log(`Collect API running on port ${port}`);
 });
 
-// Optional: graceful shutdown
 process.on("SIGTERM", async () => {
   try {
     if (pool) await pool.end();
