@@ -14,54 +14,6 @@ import dotenv from "dotenv";
 import pg from "pg";
 import crypto from "crypto";
 
-
-app.get("/bootstrap", async (req, res) => {
-  try {
-    const project_id = req.query?.pid ? String(req.query.pid) : "";
-    if (!isUuid(project_id)) return res.status(400).json({ allow: false, error: "invalid_pid" });
-
-    // إذا DB مو موجودة => منع (أمان)
-    if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
-      return res.status(200).json({ allow: false, error: "db_not_ready" });
-    }
-
-    const p = getPool();
-    if (!p) return res.status(200).json({ allow: false, error: "db_not_configured" });
-
-    // جلب المشروع
-    const proj = await p.query(
-      "select id, is_active, allowed_domains, allow_subdomains from projects where id = $1",
-      [project_id]
-    );
-
-    if (!proj.rowCount) return res.status(200).json({ allow: false, error: "project_not_found" });
-    if (!proj.rows[0].is_active) return res.status(200).json({ allow: false, error: "project_inactive" });
-
-    const { allowed_domains, allow_subdomains } = proj.rows[0];
-
-    // نفس منطق التحقق من الدومين
-    const origin = req.headers.origin ? String(req.headers.origin) : "";
-    const referer = req.headers.referer ? String(req.headers.referer) : "";
-
-    const originHost = origin ? hostFromUrl(origin) : "";
-    const refererHost = referer ? hostFromUrl(referer) : "";
-    const incomingHost = originHost || refererHost;
-
-    const ok = isAllowedHost({
-      host: incomingHost,
-      allowedDomains: allowed_domains,
-      allowSubdomains: !!allow_subdomains,
-    });
-
-    // ✅ إذا مسموح: allow=true
-    return res.status(200).json({ allow: ok });
-  } catch (e) {
-    return res.status(200).json({ allow: false, error: "server_error" });
-  }
-});
-
-
-
 dotenv.config();
 
 const { Pool } = pg;
@@ -73,6 +25,8 @@ const port = process.env.PORT || 4000;
 app.set("trust proxy", true);
 
 // -------------------- CORS --------------------
+// Optional env: CORS_ORIGINS="https://a.com,https://b.com"
+// If not set -> allow all origins (reflect origin)
 const ALLOW_LIST = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -80,9 +34,16 @@ const ALLOW_LIST = (process.env.CORS_ORIGINS || "")
 
 const corsOptions = {
   origin: (origin, cb) => {
+    // allow non-browser requests (curl/postman) with no Origin
     if (!origin) return cb(null, true);
+
+    // if no allow-list specified, allow all (reflect origin)
     if (ALLOW_LIST.length === 0) return cb(null, true);
+
+    // allow only listed origins
     if (ALLOW_LIST.includes(origin)) return cb(null, true);
+
+    // reject origin (CORS)
     return cb(null, false);
   },
   methods: ["POST", "OPTIONS", "GET"],
@@ -91,9 +52,11 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
+// IMPORTANT: CORS must be before helmet/routes, and OPTIONS must be global
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
+// Helmet (disable CORP to avoid any cross-origin resource policy surprises)
 app.use(
   helmet({
     crossOriginResourcePolicy: false,
@@ -113,6 +76,7 @@ function getPool() {
   const url = process.env.DATABASE_URL;
   if (!url) return null;
 
+  // Render/Postgres often needs TLS. If DATABASE_URL contains sslmode=require => enable ssl.
   const needsSSL = /sslmode=require/i.test(url);
 
   pool = new Pool({
@@ -143,9 +107,11 @@ function parseBody(req) {
 }
 
 function getClientIp(req) {
+  // Cloudflare
   const cf = req.headers["cf-connecting-ip"];
   if (cf) return String(cf);
 
+  // Proxies
   const xff = req.headers["x-forwarded-for"];
   if (xff) return String(xff).split(",")[0].trim();
 
@@ -166,7 +132,7 @@ function isAllowedHost({ host, allowedDomains, allowSubdomains }) {
   const h = (host || "").toLowerCase();
   if (!h) return false;
 
-  // IMPORTANT: empty list => deny all
+  // IMPORTANT: empty list => deny all (safer than allow-all)
   if (!Array.isArray(allowedDomains) || allowedDomains.length === 0) return false;
 
   for (const dRaw of allowedDomains) {
@@ -200,28 +166,28 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// ✅ NEW: bootstrap (gate) — this decides if SDK is allowed to download
+// ✅ NEW: bootstrap (gate) — decide if SDK is allowed to download
 // Example: GET /bootstrap?pid=<project_uuid>
 app.get("/bootstrap", async (req, res) => {
-  const project_id = String(req.query.pid || "").trim();
+  const project_id = String(req.query?.pid || "").trim();
   if (!isUuid(project_id)) {
     return res.status(400).json({ allow: false, error: "invalid_project_id" });
   }
 
-  // If DB missing => safest: deny (because you want no download for unknown)
+  // If DB missing => safest: deny (you want no download for unknown)
   if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
-    return res.status(403).json({ allow: false, error: "service_not_ready" });
+    return res.status(200).json({ allow: false, error: "service_not_ready" });
   }
 
   const p = getPool();
-  if (!p) return res.status(403).json({ allow: false, error: "db_not_configured" });
+  if (!p) return res.status(200).json({ allow: false, error: "db_not_configured" });
 
   try {
     const proj = await p.query(
       "select id, allowed_domains, allow_subdomains from projects where id = $1 and is_active = true",
       [project_id]
     );
-    if (!proj.rowCount) return res.status(403).json({ allow: false, error: "project_inactive" });
+    if (!proj.rowCount) return res.status(200).json({ allow: false, error: "project_inactive" });
 
     const { allowed_domains, allow_subdomains } = proj.rows[0];
 
@@ -234,13 +200,17 @@ app.get("/bootstrap", async (req, res) => {
     });
 
     if (!ok) {
-      return res.status(403).json({ allow: false, error: "domain_not_allowed", host: host || null });
+      return res.status(200).json({
+        allow: false,
+        error: "domain_not_allowed",
+        host: host || null,
+      });
     }
 
-    return res.json({ allow: true });
+    return res.status(200).json({ allow: true });
   } catch (err) {
     console.error("BOOTSTRAP_ERROR:", err);
-    return res.status(500).json({ allow: false, error: "server_error" });
+    return res.status(200).json({ allow: false, error: "server_error" });
   }
 });
 
@@ -256,7 +226,7 @@ app.post("/collect", async (req, res) => {
 
   const ip = getClientIp(req);
 
-  // MOCK MODE
+  // ✅ MOCK MODE (no DB) — if DATABASE_URL missing OR MOCK_MODE=1
   if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
     console.log("[MOCK] /collect batch:", {
       project_id,
@@ -281,6 +251,7 @@ app.post("/collect", async (req, res) => {
   if (!p) return res.status(503).json({ error: "db_not_configured" });
 
   try {
+    // project must exist + active + (domains rules)
     const proj = await p.query(
       "select id, allowed_domains, allow_subdomains from projects where id = $1 and is_active = true",
       [project_id]
@@ -289,7 +260,9 @@ app.post("/collect", async (req, res) => {
 
     const { allowed_domains, allow_subdomains } = proj.rows[0];
 
+    // ✅ enforce domains server-side (NOT CORS)
     const host = getIncomingHost(req);
+
     if (
       !isAllowedHost({
         host,
@@ -303,6 +276,7 @@ app.post("/collect", async (req, res) => {
       });
     }
 
+    // validate + prepare insert
     const values = [];
     const rows = [];
     let idx = 1;
@@ -318,8 +292,10 @@ app.post("/collect", async (req, res) => {
         return res.status(400).json({ error: "invalid_event_ts" });
       }
 
+      // ✅ guarantee event id (fix DB error: events_raw.id NOT NULL)
       const eventId = crypto.randomUUID();
 
+      // ✅ attach ip to context (server truth)
       const context = ev.context && typeof ev.context === "object" ? ev.context : {};
       context.ip = ip;
 
@@ -327,7 +303,7 @@ app.post("/collect", async (req, res) => {
         `$${idx++}`, // id
         `$${idx++}`, // project_id
         `$${idx++}`, // event_name
-        `to_timestamp($${idx++}/1000.0)`, // event_ts
+        `to_timestamp($${idx++}/1000.0)`, // event_ts (ms)
         "now()", // received_at
         `$${idx++}`, // anonymous_id
         `$${idx++}`, // session_id
@@ -363,6 +339,7 @@ app.post("/collect", async (req, res) => {
       );
     }
 
+    // ✅ include id column first
     const sql = `
       insert into events_raw (
         id,
@@ -397,6 +374,7 @@ app.listen(port, () => {
   console.log(`Collect API running on port ${port}`);
 });
 
+// Optional: graceful shutdown
 process.on("SIGTERM", async () => {
   try {
     if (pool) await pool.end();
