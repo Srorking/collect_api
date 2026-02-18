@@ -1,11 +1,11 @@
 // collect-api/src/index.js
-// Collect API — Render-ready
-// - Strong CORS (preflight + responses)
-// - Lazy DB pool
-// - MOCK_MODE
-// - Server-side domain enforcement (projects.allowed_domains + allow_subdomains)
-// - /bootstrap returns allow + sdk_url
-// - /collect inserts events with UUID id + attaches ip in context
+// Collect API — batch /collect -> PostgreSQL (Render-ready)
+// - Strong CORS (2xx/4xx/5xx + preflight)
+// - Lazy DB pool (no crash if DATABASE_URL missing)
+// - MOCK_MODE supported
+// - Server-side domain enforcement using projects.allowed_domains + allow_subdomains
+// - Adds per-event UUID (fixes: null value in column "id" of events_raw)
+// - ✅ NEW: /bootstrap endpoint to allow/deny SDK download BEFORE it loads
 
 import express from "express";
 import cors from "cors";
@@ -104,6 +104,7 @@ function getClientIp(req) {
   return req.ip || null;
 }
 
+// domain helpers
 function hostFromUrl(url) {
   try {
     const u = new URL(url);
@@ -117,7 +118,7 @@ function isAllowedHost({ host, allowedDomains, allowSubdomains }) {
   const h = (host || "").toLowerCase();
   if (!h) return false;
 
-  // ✅ Empty list => deny all (safer)
+  // IMPORTANT: empty list => deny all
   if (!Array.isArray(allowedDomains) || allowedDomains.length === 0) return false;
 
   for (const dRaw of allowedDomains) {
@@ -130,15 +131,7 @@ function isAllowedHost({ host, allowedDomains, allowSubdomains }) {
   return false;
 }
 
-async function loadProject(client, project_id) {
-  const q = await client.query(
-    "select id, is_active, allowed_domains, allow_subdomains from projects where id=$1",
-    [project_id]
-  );
-  return q.rowCount ? q.rows[0] : null;
-}
-
-function incomingHostFromReq(req) {
+function getIncomingHost(req) {
   const origin = req.headers.origin ? String(req.headers.origin) : "";
   const referer = req.headers.referer ? String(req.headers.referer) : "";
 
@@ -159,71 +152,47 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// ✅ Bootstrap gate: if not allowed => do NOT download sdk
-// GET /bootstrap?pid=<project_uuid>&v=<tagVersion>&cb=<cdnBase>
+// ✅ NEW: bootstrap (gate) — this decides if SDK is allowed to download
+// Example: GET /bootstrap?pid=<project_uuid>
 app.get("/bootstrap", async (req, res) => {
-  const project_id = String(req.query.pid || "");
-  const tagVersion = String(req.query.v || "");
-  const cdnBase = String(req.query.cb || "");
-
+  const project_id = String(req.query.pid || "").trim();
   if (!isUuid(project_id)) {
     return res.status(400).json({ allow: false, error: "invalid_project_id" });
   }
 
-  // MOCK: allow=false by default (so you don't leak SDK if DB not configured)
+  // If DB missing => safest: deny (because you want no download for unknown)
   if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
-    return res.status(200).json({
-      allow: false,
-      reason: "mock_or_db_missing",
-    });
+    return res.status(403).json({ allow: false, error: "service_not_ready" });
   }
 
   const p = getPool();
-  if (!p) return res.status(503).json({ allow: false, error: "db_not_configured" });
+  if (!p) return res.status(403).json({ allow: false, error: "db_not_configured" });
 
   try {
-    const client = await p.connect();
-    try {
-      const proj = await loadProject(client, project_id);
-      if (!proj || !proj.is_active) {
-        return res.status(200).json({ allow: false, reason: "project_inactive" });
-      }
+    const proj = await p.query(
+      "select id, allowed_domains, allow_subdomains from projects where id = $1 and is_active = true",
+      [project_id]
+    );
+    if (!proj.rowCount) return res.status(403).json({ allow: false, error: "project_inactive" });
 
-      const incomingHost = incomingHostFromReq(req);
+    const { allowed_domains, allow_subdomains } = proj.rows[0];
 
-      const okDomain = isAllowedHost({
-        host: incomingHost,
-        allowedDomains: proj.allowed_domains,
-        allowSubdomains: !!proj.allow_subdomains,
-      });
+    const host = getIncomingHost(req);
 
-      if (!okDomain) {
-        return res.status(200).json({
-          allow: false,
-          reason: "domain_not_allowed",
-          host: incomingHost || null,
-        });
-      }
+    const ok = isAllowedHost({
+      host,
+      allowedDomains: allowed_domains,
+      allowSubdomains: !!allow_subdomains,
+    });
 
-      // If allowed, return sdk_url (absolute) (use cdnBase passed from tag)
-      const safeBase = cdnBase || "";
-      const sdk_url =
-        safeBase && safeBase.startsWith("http")
-          ? `${safeBase}/core/sdk.min.js?pid=${encodeURIComponent(project_id)}&v=${encodeURIComponent(
-              tagVersion || ""
-            )}`
-          : null;
-
-      return res.status(200).json({
-        allow: true,
-        sdk_url,
-      });
-    } finally {
-      client.release();
+    if (!ok) {
+      return res.status(403).json({ allow: false, error: "domain_not_allowed", host: host || null });
     }
+
+    return res.json({ allow: true });
   } catch (err) {
     console.error("BOOTSTRAP_ERROR:", err);
-    return res.status(200).json({ allow: false, reason: "server_error" });
+    return res.status(500).json({ allow: false, error: "server_error" });
   }
 });
 
@@ -239,7 +208,7 @@ app.post("/collect", async (req, res) => {
 
   const ip = getClientIp(req);
 
-  // MOCK
+  // MOCK MODE
   if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
     console.log("[MOCK] /collect batch:", {
       project_id,
@@ -264,7 +233,6 @@ app.post("/collect", async (req, res) => {
   if (!p) return res.status(503).json({ error: "db_not_configured" });
 
   try {
-    // project must exist + active + domain allowed
     const proj = await p.query(
       "select id, allowed_domains, allow_subdomains from projects where id = $1 and is_active = true",
       [project_id]
@@ -273,18 +241,17 @@ app.post("/collect", async (req, res) => {
 
     const { allowed_domains, allow_subdomains } = proj.rows[0];
 
-    const incomingHost = incomingHostFromReq(req);
-
+    const host = getIncomingHost(req);
     if (
       !isAllowedHost({
-        host: incomingHost,
+        host,
         allowedDomains: allowed_domains,
         allowSubdomains: !!allow_subdomains,
       })
     ) {
       return res.status(403).json({
         error: "domain_not_allowed",
-        host: incomingHost || null,
+        host: host || null,
       });
     }
 
@@ -377,6 +344,7 @@ app.post("/collect", async (req, res) => {
   }
 });
 
+// -------------------- Start --------------------
 app.listen(port, () => {
   console.log(`Collect API running on port ${port}`);
 });
