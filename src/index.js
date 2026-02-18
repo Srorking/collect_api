@@ -14,6 +14,54 @@ import dotenv from "dotenv";
 import pg from "pg";
 import crypto from "crypto";
 
+
+app.get("/bootstrap", async (req, res) => {
+  try {
+    const project_id = req.query?.pid ? String(req.query.pid) : "";
+    if (!isUuid(project_id)) return res.status(400).json({ allow: false, error: "invalid_pid" });
+
+    // إذا DB مو موجودة => منع (أمان)
+    if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
+      return res.status(200).json({ allow: false, error: "db_not_ready" });
+    }
+
+    const p = getPool();
+    if (!p) return res.status(200).json({ allow: false, error: "db_not_configured" });
+
+    // جلب المشروع
+    const proj = await p.query(
+      "select id, is_active, allowed_domains, allow_subdomains from projects where id = $1",
+      [project_id]
+    );
+
+    if (!proj.rowCount) return res.status(200).json({ allow: false, error: "project_not_found" });
+    if (!proj.rows[0].is_active) return res.status(200).json({ allow: false, error: "project_inactive" });
+
+    const { allowed_domains, allow_subdomains } = proj.rows[0];
+
+    // نفس منطق التحقق من الدومين
+    const origin = req.headers.origin ? String(req.headers.origin) : "";
+    const referer = req.headers.referer ? String(req.headers.referer) : "";
+
+    const originHost = origin ? hostFromUrl(origin) : "";
+    const refererHost = referer ? hostFromUrl(referer) : "";
+    const incomingHost = originHost || refererHost;
+
+    const ok = isAllowedHost({
+      host: incomingHost,
+      allowedDomains: allowed_domains,
+      allowSubdomains: !!allow_subdomains,
+    });
+
+    // ✅ إذا مسموح: allow=true
+    return res.status(200).json({ allow: ok });
+  } catch (e) {
+    return res.status(200).json({ allow: false, error: "server_error" });
+  }
+});
+
+
+
 dotenv.config();
 
 const { Pool } = pg;
