@@ -1,11 +1,11 @@
 // collect-api/src/index.js
-// Collect API — batch /collect -> PostgreSQL (Render-ready)
-// - Strong CORS (2xx/4xx/5xx + preflight)
-// - Lazy DB pool (no crash if DATABASE_URL missing)
-// - MOCK_MODE supported
-// - Server-side domain enforcement using projects.allowed_domains + allow_subdomains
-// - Adds per-event UUID (fixes: null value in column "id" of events_raw)
-// - NEW: /bootstrap gate to prevent SDK download if not allowed
+// Collect API — Render-ready
+// - Strong CORS (preflight + responses)
+// - Lazy DB pool
+// - MOCK_MODE
+// - Server-side domain enforcement (projects.allowed_domains + allow_subdomains)
+// - /bootstrap returns allow + sdk_url
+// - /collect inserts events with UUID id + attaches ip in context
 
 import express from "express";
 import cors from "cors";
@@ -25,8 +25,6 @@ const port = process.env.PORT || 4000;
 app.set("trust proxy", true);
 
 // -------------------- CORS --------------------
-// Optional env: CORS_ORIGINS="https://a.com,https://b.com"
-// If not set -> allow all origins (reflect origin)
 const ALLOW_LIST = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -106,7 +104,6 @@ function getClientIp(req) {
   return req.ip || null;
 }
 
-// domain helpers
 function hostFromUrl(url) {
   try {
     const u = new URL(url);
@@ -120,7 +117,7 @@ function isAllowedHost({ host, allowedDomains, allowSubdomains }) {
   const h = (host || "").toLowerCase();
   if (!h) return false;
 
-  // IMPORTANT: empty list => deny all (safer than allow-all)
+  // ✅ Empty list => deny all (safer)
   if (!Array.isArray(allowedDomains) || allowedDomains.length === 0) return false;
 
   for (const dRaw of allowedDomains) {
@@ -133,12 +130,21 @@ function isAllowedHost({ host, allowedDomains, allowSubdomains }) {
   return false;
 }
 
-function getIncomingHost(req) {
+async function loadProject(client, project_id) {
+  const q = await client.query(
+    "select id, is_active, allowed_domains, allow_subdomains from projects where id=$1",
+    [project_id]
+  );
+  return q.rowCount ? q.rows[0] : null;
+}
+
+function incomingHostFromReq(req) {
   const origin = req.headers.origin ? String(req.headers.origin) : "";
   const referer = req.headers.referer ? String(req.headers.referer) : "";
 
   const originHost = origin ? hostFromUrl(origin) : "";
   const refererHost = referer ? hostFromUrl(referer) : "";
+
   return originHost || refererHost || "";
 }
 
@@ -153,58 +159,71 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// ✅ NEW: Bootstrap gate
-// Tag will call: GET /bootstrap?pid=<project_uuid>
-// If not allowed => { allow:false } and tag WILL NOT load sdk.min.js
+// ✅ Bootstrap gate: if not allowed => do NOT download sdk
+// GET /bootstrap?pid=<project_uuid>&v=<tagVersion>&cb=<cdnBase>
 app.get("/bootstrap", async (req, res) => {
+  const project_id = String(req.query.pid || "");
+  const tagVersion = String(req.query.v || "");
+  const cdnBase = String(req.query.cb || "");
+
+  if (!isUuid(project_id)) {
+    return res.status(400).json({ allow: false, error: "invalid_project_id" });
+  }
+
+  // MOCK: allow=false by default (so you don't leak SDK if DB not configured)
+  if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
+    return res.status(200).json({
+      allow: false,
+      reason: "mock_or_db_missing",
+    });
+  }
+
+  const p = getPool();
+  if (!p) return res.status(503).json({ allow: false, error: "db_not_configured" });
+
   try {
-    const project_id = String(req.query.pid || "");
+    const client = await p.connect();
+    try {
+      const proj = await loadProject(client, project_id);
+      if (!proj || !proj.is_active) {
+        return res.status(200).json({ allow: false, reason: "project_inactive" });
+      }
 
-    if (!isUuid(project_id)) {
-      return res.status(400).json({ allow: false, error: "invalid_project_id" });
-    }
+      const incomingHost = incomingHostFromReq(req);
 
-    // ✅ allow in mock mode (for testing)
-    if (process.env.MOCK_MODE === "1") {
-      return res.status(200).json({ allow: true, mode: "mock" });
-    }
-
-    const p = getPool();
-    if (!p) {
-      // ✅ IMPORTANT: deny if DB not configured (prevents free usage)
-      return res.status(503).json({ allow: false, error: "db_not_configured" });
-    }
-
-    const proj = await p.query(
-      "select id, allowed_domains, allow_subdomains from projects where id = $1 and is_active = true",
-      [project_id]
-    );
-    if (!proj.rowCount) {
-      return res.status(403).json({ allow: false, error: "project_inactive" });
-    }
-
-    const { allowed_domains, allow_subdomains } = proj.rows[0];
-
-    const host = getIncomingHost(req);
-
-    if (
-      !isAllowedHost({
-        host,
-        allowedDomains: allowed_domains,
-        allowSubdomains: !!allow_subdomains,
-      })
-    ) {
-      return res.status(403).json({
-        allow: false,
-        error: "domain_not_allowed",
-        host: host || null,
+      const okDomain = isAllowedHost({
+        host: incomingHost,
+        allowedDomains: proj.allowed_domains,
+        allowSubdomains: !!proj.allow_subdomains,
       });
-    }
 
-    return res.status(200).json({ allow: true });
-  } catch (e) {
-    console.error("BOOTSTRAP_ERROR:", e);
-    return res.status(500).json({ allow: false, error: "server_error" });
+      if (!okDomain) {
+        return res.status(200).json({
+          allow: false,
+          reason: "domain_not_allowed",
+          host: incomingHost || null,
+        });
+      }
+
+      // If allowed, return sdk_url (absolute) (use cdnBase passed from tag)
+      const safeBase = cdnBase || "";
+      const sdk_url =
+        safeBase && safeBase.startsWith("http")
+          ? `${safeBase}/core/sdk.min.js?pid=${encodeURIComponent(project_id)}&v=${encodeURIComponent(
+              tagVersion || ""
+            )}`
+          : null;
+
+      return res.status(200).json({
+        allow: true,
+        sdk_url,
+      });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error("BOOTSTRAP_ERROR:", err);
+    return res.status(200).json({ allow: false, reason: "server_error" });
   }
 });
 
@@ -220,7 +239,7 @@ app.post("/collect", async (req, res) => {
 
   const ip = getClientIp(req);
 
-  // ✅ MOCK MODE (no DB) — if DATABASE_URL missing OR MOCK_MODE=1
+  // MOCK
   if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
     console.log("[MOCK] /collect batch:", {
       project_id,
@@ -245,7 +264,7 @@ app.post("/collect", async (req, res) => {
   if (!p) return res.status(503).json({ error: "db_not_configured" });
 
   try {
-    // project must exist + active + (domains rules)
+    // project must exist + active + domain allowed
     const proj = await p.query(
       "select id, allowed_domains, allow_subdomains from projects where id = $1 and is_active = true",
       [project_id]
@@ -254,19 +273,18 @@ app.post("/collect", async (req, res) => {
 
     const { allowed_domains, allow_subdomains } = proj.rows[0];
 
-    // ✅ enforce domains server-side (NOT CORS)
-    const host = getIncomingHost(req);
+    const incomingHost = incomingHostFromReq(req);
 
     if (
       !isAllowedHost({
-        host,
+        host: incomingHost,
         allowedDomains: allowed_domains,
         allowSubdomains: !!allow_subdomains,
       })
     ) {
       return res.status(403).json({
         error: "domain_not_allowed",
-        host: host || null,
+        host: incomingHost || null,
       });
     }
 
@@ -294,7 +312,7 @@ app.post("/collect", async (req, res) => {
         `$${idx++}`, // id
         `$${idx++}`, // project_id
         `$${idx++}`, // event_name
-        `to_timestamp($${idx++}/1000.0)`, // event_ts (ms)
+        `to_timestamp($${idx++}/1000.0)`, // event_ts
         "now()", // received_at
         `$${idx++}`, // anonymous_id
         `$${idx++}`, // session_id
@@ -359,7 +377,6 @@ app.post("/collect", async (req, res) => {
   }
 });
 
-// -------------------- Start --------------------
 app.listen(port, () => {
   console.log(`Collect API running on port ${port}`);
 });
