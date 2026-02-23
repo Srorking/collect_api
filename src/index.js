@@ -5,8 +5,7 @@
 // - MOCK_MODE supported
 // - Server-side domain enforcement using projects.allowed_domains + allow_subdomains
 // - Adds per-event UUID (fixes: null value in column "id" of events_raw)
-// - /bootstrap endpoint to allow/deny SDK download BEFORE it loads
-// - ✅ AES-GCM optional encrypted payload support via /crypto/bootstrap
+// - ✅ NEW: /bootstrap endpoint to allow/deny SDK download BEFORE it loads
 
 import express from "express";
 import cors from "cors";
@@ -35,9 +34,16 @@ const ALLOW_LIST = (process.env.CORS_ORIGINS || "")
 
 const corsOptions = {
   origin: (origin, cb) => {
+    // allow non-browser requests (curl/postman) with no Origin
     if (!origin) return cb(null, true);
+
+    // if no allow-list specified, allow all (reflect origin)
     if (ALLOW_LIST.length === 0) return cb(null, true);
+
+    // allow only listed origins
     if (ALLOW_LIST.includes(origin)) return cb(null, true);
+
+    // reject origin (CORS)
     return cb(null, false);
   },
   methods: ["POST", "OPTIONS", "GET"],
@@ -70,6 +76,7 @@ function getPool() {
   const url = process.env.DATABASE_URL;
   if (!url) return null;
 
+  // Render/Postgres often needs TLS. If DATABASE_URL contains sslmode=require => enable ssl.
   const needsSSL = /sslmode=require/i.test(url);
 
   pool = new Pool({
@@ -125,7 +132,7 @@ function isAllowedHost({ host, allowedDomains, allowSubdomains }) {
   const h = (host || "").toLowerCase();
   if (!h) return false;
 
-  // IMPORTANT: empty list => deny all (safer)
+  // IMPORTANT: empty list => deny all (safer than allow-all)
   if (!Array.isArray(allowedDomains) || allowedDomains.length === 0) return false;
 
   for (const dRaw of allowedDomains) {
@@ -148,24 +155,6 @@ function getIncomingHost(req) {
   return originHost || refererHost || "";
 }
 
-// -------------------- AES-GCM session store --------------------
-// NOTE: This is in-memory. On multi-instance you need Redis/shared store.
-const cryptoSessions = new Map(); // kid -> { key: Buffer, exp: number }
-
-function b64(buf) {
-  return Buffer.from(buf).toString("base64");
-}
-function b64ToBuf(str) {
-  return Buffer.from(String(str || ""), "base64");
-}
-function cleanupCryptoSessions() {
-  const now = Date.now();
-  for (const [kid, s] of cryptoSessions.entries()) {
-    if (!s || !s.exp || now > s.exp) cryptoSessions.delete(kid);
-  }
-}
-setInterval(cleanupCryptoSessions, 60 * 1000).unref?.();
-
 // -------------------- Routes --------------------
 app.get("/health", async (_req, res) => {
   try {
@@ -177,15 +166,15 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// ✅ Gate BEFORE downloading SDK
+// ✅ NEW: bootstrap (gate) — decide if SDK is allowed to download
 // Example: GET /bootstrap?pid=<project_uuid>
 app.get("/bootstrap", async (req, res) => {
-  const project_id = String(req.query.pid || "").trim();
+  const project_id = String(req.query?.pid || "").trim();
   if (!isUuid(project_id)) {
     return res.status(400).json({ allow: false, error: "invalid_project_id" });
   }
 
-  // If DB missing => safest: deny (because you want no download for unknown)
+  // If DB missing => safest: deny (you want no download for unknown)
   if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
     return res.status(200).json({ allow: false, error: "service_not_ready" });
   }
@@ -201,6 +190,7 @@ app.get("/bootstrap", async (req, res) => {
     if (!proj.rowCount) return res.status(200).json({ allow: false, error: "project_inactive" });
 
     const { allowed_domains, allow_subdomains } = proj.rows[0];
+
     const host = getIncomingHost(req);
 
     const ok = isAllowedHost({
@@ -209,97 +199,24 @@ app.get("/bootstrap", async (req, res) => {
       allowSubdomains: !!allow_subdomains,
     });
 
-    return res.status(200).json(ok ? { allow: true } : { allow: false, error: "domain_not_allowed", host: host || null });
+    if (!ok) {
+      return res.status(200).json({
+        allow: false,
+        error: "domain_not_allowed",
+        host: host || null,
+      });
+    }
+
+    return res.status(200).json({ allow: true });
   } catch (err) {
     console.error("BOOTSTRAP_ERROR:", err);
     return res.status(200).json({ allow: false, error: "server_error" });
   }
 });
 
-// ✅ AES key bootstrap (temporary session key)
-// Example: GET /crypto/bootstrap?pid=<project_uuid>
-app.get("/crypto/bootstrap", async (req, res) => {
-  const project_id = String(req.query.pid || "").trim();
-  if (!isUuid(project_id)) return res.status(400).json({ error: "invalid_project_id" });
-
-  // If DB not ready => deny issuing key
-  if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
-    return res.status(403).json({ error: "service_not_ready" });
-  }
-
-  const p = getPool();
-  if (!p) return res.status(403).json({ error: "db_not_configured" });
-
-  try {
-    // OPTIONAL: enforce same rules as /bootstrap before issuing key
-    const proj = await p.query(
-      "select id, allowed_domains, allow_subdomains from projects where id = $1 and is_active = true",
-      [project_id]
-    );
-    if (!proj.rowCount) return res.status(403).json({ error: "project_inactive" });
-
-    const { allowed_domains, allow_subdomains } = proj.rows[0];
-    const host = getIncomingHost(req);
-
-    const ok = isAllowedHost({
-      host,
-      allowedDomains: allowed_domains,
-      allowSubdomains: !!allow_subdomains,
-    });
-
-    if (!ok) return res.status(403).json({ error: "domain_not_allowed", host: host || null });
-
-    const kid = crypto.randomUUID();
-    const key = crypto.randomBytes(32); // AES-256 key
-    const exp = Date.now() + 5 * 60 * 1000; // 5 minutes
-
-    cryptoSessions.set(kid, { key, exp });
-
-    return res.json({
-      kid,
-      key: b64(key),
-      exp,
-    });
-  } catch (e) {
-    console.error("CRYPTO_BOOTSTRAP_ERROR:", e);
-    return res.status(500).json({ error: "server_error" });
-  }
-});
-
 app.post("/collect", async (req, res) => {
-  let body = parseBody(req);
+  const body = parseBody(req);
   if (!body) return res.status(400).json({ error: "invalid_json" });
-
-  // ✅ If encrypted payload, decrypt first
-  if (body.encrypted === true) {
-    const kid = String(body.kid || "");
-    const session = cryptoSessions.get(kid);
-
-    if (!session) return res.status(403).json({ error: "invalid_kid" });
-    if (Date.now() > session.exp) return res.status(403).json({ error: "key_expired" });
-
-    try {
-      const iv = b64ToBuf(body.iv);
-      const aad = b64ToBuf(body.aad);
-      const raw = b64ToBuf(body.ciphertext);
-
-      if (iv.length !== 12) return res.status(400).json({ error: "invalid_iv" });
-      if (raw.length < 16) return res.status(400).json({ error: "invalid_ciphertext" });
-
-      // WebCrypto AES-GCM returns ciphertext||tag (tag 16 bytes)
-      const tag = raw.subarray(raw.length - 16);
-      const enc = raw.subarray(0, raw.length - 16);
-
-      const decipher = crypto.createDecipheriv("aes-256-gcm", session.key, iv);
-      decipher.setAAD(aad);
-      decipher.setAuthTag(tag);
-
-      const decrypted = Buffer.concat([decipher.update(enc), decipher.final()]);
-      body = JSON.parse(decrypted.toString("utf8"));
-    } catch (e) {
-      return res.status(400).json({ error: "decryption_failed" });
-    }
-  }
 
   const { project_id, events, sent_at } = body;
 
@@ -309,7 +226,7 @@ app.post("/collect", async (req, res) => {
 
   const ip = getClientIp(req);
 
-  // ✅ MOCK MODE (no DB)
+  // ✅ MOCK MODE (no DB) — if DATABASE_URL missing OR MOCK_MODE=1
   if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
     console.log("[MOCK] /collect batch:", {
       project_id,
@@ -334,7 +251,7 @@ app.post("/collect", async (req, res) => {
   if (!p) return res.status(503).json({ error: "db_not_configured" });
 
   try {
-    // project must exist + active + domain rules
+    // project must exist + active + (domains rules)
     const proj = await p.query(
       "select id, allowed_domains, allow_subdomains from projects where id = $1 and is_active = true",
       [project_id]
@@ -343,7 +260,9 @@ app.post("/collect", async (req, res) => {
 
     const { allowed_domains, allow_subdomains } = proj.rows[0];
 
+    // ✅ enforce domains server-side (NOT CORS)
     const host = getIncomingHost(req);
+
     if (
       !isAllowedHost({
         host,
@@ -351,7 +270,10 @@ app.post("/collect", async (req, res) => {
         allowSubdomains: !!allow_subdomains,
       })
     ) {
-      return res.status(403).json({ error: "domain_not_allowed", host: host || null });
+      return res.status(403).json({
+        error: "domain_not_allowed",
+        host: host || null,
+      });
     }
 
     // validate + prepare insert
@@ -370,8 +292,10 @@ app.post("/collect", async (req, res) => {
         return res.status(400).json({ error: "invalid_event_ts" });
       }
 
+      // ✅ guarantee event id (fix DB error: events_raw.id NOT NULL)
       const eventId = crypto.randomUUID();
 
+      // ✅ attach ip to context (server truth)
       const context = ev.context && typeof ev.context === "object" ? ev.context : {};
       context.ip = ip;
 
@@ -415,6 +339,7 @@ app.post("/collect", async (req, res) => {
       );
     }
 
+    // ✅ include id column first
     const sql = `
       insert into events_raw (
         id,
