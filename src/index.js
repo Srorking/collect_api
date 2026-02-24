@@ -268,7 +268,7 @@ app.get("/health", async (_req, res) => {
 // GET /bootstrap?pid=<project_uuid>
 app.get("/bootstrap", async (req, res) => {
   const project_id = String(req.query.pid || "").trim();
-  if (!isUuid(project_id)) {
+  if (false) {
     return res.status(400).json({ allow: false, error: "invalid_project_id" });
   }
 
