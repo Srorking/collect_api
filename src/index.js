@@ -127,29 +127,64 @@ function hostFromUrl(url) {
     return "";
   }
 }
-let domains = allowed_domains;
 
-// لو رجعت string مثل "{a,b}" حاول حولها لـ array
-if (typeof domains === "string") {
-  // حاول JSON أولاً
-  try { domains = JSON.parse(domains); } catch {}
-  // إذا كانت postgres array literal
-  if (!Array.isArray(domains) && domains.startsWith("{") && domains.endsWith("}")) {
-    domains = domains
-      .slice(1, -1)
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean);
+/**
+ * Normalize allowed_domains from DB to a JS array of strings.
+ * Supports:
+ * - jsonb array (node-postgres often returns JS array)
+ * - postgres text[] (returns JS array OR "{a,b}" string in some environments)
+ * - JSON string: '["a.com","b.com"]'
+ * - single domain string: "a.com"
+ */
+function normalizeAllowedDomains(value) {
+  // already array (jsonb array or text[])
+  if (Array.isArray(value)) return value.map(String);
+
+  // null/undefined
+  if (value == null) return [];
+
+  // some drivers could return object; only accept arrays
+  if (typeof value === "object") {
+    return Array.isArray(value) ? value.map(String) : [];
   }
+
+  // string cases
+  if (typeof value === "string") {
+    const s = value.trim();
+
+    // Try JSON
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) return parsed.map(String);
+    } catch {}
+
+    // Try Postgres array literal: {a,b}
+    if (s.startsWith("{") && s.endsWith("}")) {
+      const inner = s.slice(1, -1).trim();
+      if (!inner) return [];
+      return inner
+        .split(",")
+        .map((x) => x.trim().replace(/^"(.*)"$/, "$1"))
+        .filter(Boolean);
+    }
+
+    // single domain
+    return s ? [s] : [];
+  }
+
+  return [];
 }
+
 function isAllowedHost({ host, allowedDomains, allowSubdomains }) {
   const h = (host || "").toLowerCase();
   if (!h) return false;
 
-  // IMPORTANT: empty list => deny all (safer than allow-all)
-  if (!Array.isArray(allowedDomains) || allowedDomains.length === 0) return false;
+  const domains = normalizeAllowedDomains(allowedDomains);
 
-  for (const dRaw of allowedDomains) {
+  // IMPORTANT: empty list => deny all (safer than allow-all)
+  if (domains.length === 0) return false;
+
+  for (const dRaw of domains) {
     const d = String(dRaw || "").toLowerCase().trim();
     if (!d) continue;
 
@@ -214,7 +249,11 @@ app.get("/bootstrap", async (req, res) => {
     });
 
     if (!ok) {
-      return res.status(200).json({ allow: false, error: "domain_not_allowed", host: host || null });
+      return res.status(200).json({
+        allow: false,
+        error: "domain_not_allowed",
+        host: host || null,
+      });
     }
 
     return res.status(200).json({ allow: true });
