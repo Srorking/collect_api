@@ -127,7 +127,21 @@ function hostFromUrl(url) {
     return "";
   }
 }
+let domains = allowed_domains;
 
+// لو رجعت string مثل "{a,b}" حاول حولها لـ array
+if (typeof domains === "string") {
+  // حاول JSON أولاً
+  try { domains = JSON.parse(domains); } catch {}
+  // إذا كانت postgres array literal
+  if (!Array.isArray(domains) && domains.startsWith("{") && domains.endsWith("}")) {
+    domains = domains
+      .slice(1, -1)
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean);
+  }
+}
 function isAllowedHost({ host, allowedDomains, allowSubdomains }) {
   const h = (host || "").toLowerCase();
   if (!h) return false;
