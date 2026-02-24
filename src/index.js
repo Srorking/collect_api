@@ -273,28 +273,28 @@ app.get("/bootstrap", async (req, res) => {
   }
 
   try {
-    // const projects = await getProjectsFromUpstream();
-    // const proj = projects.find((p) => p.id === project_id);
+    const projects = await getProjectsFromUpstream();
+    const proj = projects.find((p) => p.id === project_id);
 
-    // if (!proj || !proj.is_active) {
-    //   return res.status(200).json({ allow: false, error: "project_inactive" });
-    // }
+    if (!proj || !proj.is_active) {
+      return res.status(200).json({ allow: false, error: "project_inactive" });
+    }
 
-    // const host = getIncomingHost(req);
+    const host = getIncomingHost(req);
 
-    // const ok = isAllowedHost({
-    //   host,
-    //   allowedDomains: proj.allowed_domains,
-    //   allowSubdomains: !!proj.allow_subdomains,
-    // });
+    const ok = isAllowedHost({
+      host,
+      allowedDomains: proj.allowed_domains,
+      allowSubdomains: !!proj.allow_subdomains,
+    });
 
-    // if (!ok) {
-    //   return res.status(200).json({
-    //     allow: false,
-    //     error: "domain_not_allowed",
-    //     host: host || null,
-    //   });
-    // }
+    if (!ok) {
+      return res.status(200).json({
+        allow: false,
+        error: "domain_not_allowed",
+        host: host || null,
+      });
+    }
 
     return res.status(200).json({ allow: true });
   } catch (err) {
