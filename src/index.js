@@ -5,7 +5,7 @@
 // - MOCK_MODE supported
 // - Server-side domain enforcement using projects.allowed_domains + allow_subdomains
 // - Adds per-event UUID (fixes: null value in column "id" of events_raw)
-// - ✅ NEW: /bootstrap endpoint to allow/deny SDK download BEFORE it loads
+// - ✅ /bootstrap endpoint to allow/deny SDK download BEFORE it loads
 
 import express from "express";
 import cors from "cors";
@@ -166,15 +166,15 @@ app.get("/health", async (_req, res) => {
   }
 });
 
-// ✅ NEW: bootstrap (gate) — decide if SDK is allowed to download
+// ✅ NEW: bootstrap (gate) — this decides if SDK is allowed to download
 // Example: GET /bootstrap?pid=<project_uuid>
 app.get("/bootstrap", async (req, res) => {
-  const project_id = String(req.query?.pid || "").trim();
+  const project_id = String(req.query.pid || "").trim();
   if (!isUuid(project_id)) {
     return res.status(400).json({ allow: false, error: "invalid_project_id" });
   }
 
-  // If DB missing => safest: deny (you want no download for unknown)
+  // If DB missing => safest: deny (because you want no download for unknown)
   if (!process.env.DATABASE_URL || process.env.MOCK_MODE === "1") {
     return res.status(200).json({ allow: false, error: "service_not_ready" });
   }
@@ -200,11 +200,7 @@ app.get("/bootstrap", async (req, res) => {
     });
 
     if (!ok) {
-      return res.status(200).json({
-        allow: false,
-        error: "domain_not_allowed",
-        host: host || null,
-      });
+      return res.status(200).json({ allow: false, error: "domain_not_allowed", host: host || null });
     }
 
     return res.status(200).json({ allow: true });
