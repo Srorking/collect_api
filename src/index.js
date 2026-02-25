@@ -12,7 +12,7 @@ const port = process.env.PORT || 4000;
 
 // -------------------- Upstream endpoints --------------------
 const UPSTREAM_BASE = process.env.UPSTREAM_BASE || "http://glaros.souryasocial.shop";
-const UPSTREAM_PROJECTS_URL = `${UPSTREAM_BASE}/api/Projects/GetAll`;
+const UPSTREAM_PROJECTS_URL = `${UPSTREAM_BASE}/api/Projects/GetAllProjects`;
 const UPSTREAM_ADD_EVENT_URL = `${UPSTREAM_BASE}/api/Events/AddEvent`;
 const UPSTREAM_ADD_RANGE_URL = `${UPSTREAM_BASE}/api/Events/AddRange`;
 
