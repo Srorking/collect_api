@@ -115,16 +115,31 @@ function normalizeAllowedDomains(value) {
   if (Array.isArray(value)) return value.map(String);
   if (value == null) return [];
 
+  // ✅ NEW: support object like { domains: [...] } or { allowedDomains: [...] }
+  if (typeof value === "object") {
+    const maybe =
+      value.domains ??
+      value.allowedDomains ??
+      value.allowed_domains ??
+      value.items ??
+      null;
+
+    if (Array.isArray(maybe)) return maybe.map(String);
+    if (typeof maybe === "string") return [maybe];
+    return [];
+  }
+
   if (typeof value === "string") {
     const s = value.trim();
-
-    // JSON string
     try {
       const parsed = JSON.parse(s);
       if (Array.isArray(parsed)) return parsed.map(String);
+      // ✅ support JSON object string {"domains":[...]}
+      if (parsed && typeof parsed === "object" && Array.isArray(parsed.domains)) {
+        return parsed.domains.map(String);
+      }
     } catch {}
 
-    // Postgres array literal
     if (s.startsWith("{") && s.endsWith("}")) {
       const inner = s.slice(1, -1).trim();
       if (!inner) return [];
